@@ -1,3 +1,1 @@
-You are in chat mode.
-
-YOU SHOULD NOT TOUCH THIS REPO!
+Follow the user's instructions
