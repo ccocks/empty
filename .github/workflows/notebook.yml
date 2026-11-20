@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       budget_sec:
-        description: "Proximus time budget in seconds (job cap is 6h = 21600)"
-        default: "14400"
+        description: "Proximus time budget in seconds (job cap 21000; verify can take 5400)"
+        default: "10800"
       max_turns:
         description: "Proximus max turns"
         default: "400"
@@ -119,7 +119,7 @@ jobs:
           set -euo pipefail
           BUDGET="${{ inputs.budget_sec }}"; TURNS="${{ inputs.max_turns }}"
           if [ "${{ inputs.smoke }}" = "1" ]; then BUDGET=120; TURNS=8; fi
-          BUDGET=${BUDGET:-14400}; TURNS=${TURNS:-400}
+          BUDGET=${BUDGET:-10800}; TURNS=${TURNS:-400}
           cat > job_ci.yaml <<YAML
           job_name: agnes-proximus-ci
           n_concurrent_trials: 1
