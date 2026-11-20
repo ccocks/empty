@@ -88,9 +88,19 @@ jobs:
       - name: Pre-pull task images
         run: |
           set -euo pipefail
-          grep -hoE 'us-west1-docker.pkg.dev[^"]*@sha256:[0-9a-f]+' frontier-swe-v2/tasks/notebook-compression/*.toml frontier-swe-v2/tasks/notebook-compression/**/*.toml 2>/dev/null | sort -u | tee /tmp/imgs.txt
-          while read -r img; do [ -n "$img" ] && docker pull "$img"; done < /tmp/imgs.txt
-          docker images --format '{{.Repository}} {{.Size}}'
+          # -r + --include: no globstar needed, and grep cannot exit 2 on a literal '**/*.toml'
+          grep -rhoE 'us-west1-docker\.pkg\.dev[^"]*@sha256:[0-9a-f]{64}' \
+            --include='*.toml' frontier-swe-v2/tasks/notebook-compression \
+            | sort -u | tee /tmp/imgs.txt
+          echo "count=$(grep -c . /tmp/imgs.txt)"
+          while IFS= read -r img; do
+            if [ -n "$img" ]; then
+              echo "::group::docker pull $img"
+              docker pull "$img"
+              echo "::endgroup::"
+            fi
+          done < /tmp/imgs.txt
+          docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}'
 
       - name: Check for model key
         id: keycheck
