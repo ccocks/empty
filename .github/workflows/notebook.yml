@@ -1,0 +1,177 @@
+name: notebook-compression
+
+on:
+  workflow_dispatch:
+    inputs:
+      budget_sec:
+        description: "Proximus time budget in seconds (job cap is 6h = 21600)"
+        default: "14400"
+      max_turns:
+        description: "Proximus max turns"
+        default: "400"
+      smoke:
+        description: "1 = 120s/8-turn smoke run, 0 = real run"
+        default: "0"
+  push:
+    branches: [notebook-ci]
+
+concurrency:
+  group: notebook-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    # 6 h is the hard limit for a hosted job; leave headroom for setup + submit + verify.
+    timeout-minutes: 350
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Docker + metadata
+        run: |
+          docker version
+          nproc; free -g; df -h /
+          python3 -V; git --version
+
+      - name: Install Harbor + Proximus
+        run: |
+          set -euo pipefail
+          python3 -m venv .venv
+          .venv/bin/pip install -q --upgrade pip
+          .venv/bin/pip install -q harbor litellm
+          .venv/bin/pip install -q "git+https://github.com/Proximal-Labs/proximus.git"
+
+          # litellm >= 1.110 removed llms/openai/chat/gpt_5_transformation.py, which
+          # harbor-proximus imports at module load. Shim it.
+          SITE=$(.venv/bin/python -c 'import litellm, os; print(os.path.dirname(litellm.__file__))')
+          cat > "$SITE/llms/openai/chat/gpt_5_transformation.py" <<'PY'
+          """Compat shim for harbor-proximus on litellm >= 1.110."""
+          class OpenAIGPT5Config:
+              @staticmethod
+              def is_model_gpt_5_4_plus_model(model: str | None) -> bool:
+                  try:
+                      from litellm.llms.openai.chat.gpt_reasoning_transformation import (
+                          OpenAIGPT5Config as _Real,
+                      )
+                      return bool(_Real.is_model_gpt_5_4_plus_model(model))
+                  except Exception:
+                      return False
+
+
+          __all__ = ["OpenAIGPT5Config"]
+          PY
+
+          .venv/bin/python - <<'PY'
+          import harbor, harbor_proximus
+          print("harbor", getattr(harbor, "__version__", "?"))
+          print("harbor_proximus", getattr(harbor_proximus, "__version__", "?"))
+          handle = __import__("harbor_proximus.proximus", fromlist=["Proximus"]).Proximus
+          print("Proximus ok", handle.__module__)
+          PY
+
+      - name: Fetch task (upstream, pinned by commit today)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/Proximal-Labs/frontier-swe-v2.git
+          T=frontier-swe-v2/tasks/notebook-compression
+          ls "$T"
+          [ -d "$T/tests" ] || cp -r "$T/environment/tests" "$T/tests"
+          grep -E 'timeout_sec|user|image' -A1 "$T/task.toml" || true
+
+      - name: Pre-pull task images
+        run: |
+          set -euo pipefail
+          grep -hoE 'us-west1-docker.pkg.dev[^"]*@sha256:[0-9a-f]+' frontier-swe-v2/tasks/notebook-compression/*.toml frontier-swe-v2/tasks/notebook-compression/**/*.toml 2>/dev/null | sort -u | tee /tmp/imgs.txt
+          while read -r img; do [ -n "$img" ] && docker pull "$img"; done < /tmp/imgs.txt
+          docker images --format '{{.Repository}} {{.Size}}'
+
+      - name: Check for model key
+        id: keycheck
+        env:
+          AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
+        run: |
+          if [ -n "$AGNES_API_KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::AGNES_API_KEY secret is not set; skipping the agent run."
+          fi
+
+      - name: Write job config
+        run: |
+          set -euo pipefail
+          BUDGET="${{ inputs.budget_sec }}"; TURNS="${{ inputs.max_turns }}"
+          if [ "${{ inputs.smoke }}" = "1" ]; then BUDGET=120; TURNS=8; fi
+          BUDGET=${BUDGET:-14400}; TURNS=${TURNS:-400}
+          cat > job_ci.yaml <<YAML
+          job_name: agnes-proximus-ci
+          n_concurrent_trials: 1
+          quiet: false
+          environment:
+            type: docker
+          agents:
+          - name: harbor_proximus:Proximus
+            model_name: openai/agnes-3.0-flash
+            kwargs:
+              time_budget_sec: ${BUDGET}
+              max_turns: ${TURNS}
+              submission_timeout_sec: 600
+              auto_submit_on_exit: true
+              api_base: https://apihub.agnes-ai.com/v1
+              api_key_env: AGNES_API_KEY
+              temperature: 0.2
+              model_info: &mi
+                max_input_tokens: 65536
+                max_output_tokens: 8192
+                litellm_provider: openai
+                mode: chat
+                supports_function_calling: true
+                supports_vision: false
+                input_cost_per_token: 0.0
+                output_cost_per_token: 0.0
+              litellm_model_info:
+                openai/agnes-3.0-flash: *mi
+                agnes-3.0-flash: *mi
+          tasks:
+          - path: frontier-swe-v2/tasks/notebook-compression
+          YAML
+          sed -i 's/^          //' job_ci.yaml
+          cat job_ci.yaml
+          .venv/bin/python -c "import yaml,sys; d=yaml.safe_load(open('job_ci.yaml')); print('parsed', d['agents'][0]['kwargs']['time_budget_sec'], d['agents'][0]['kwargs']['max_turns'])"
+
+      - name: Run Proximus on the real task
+        if: steps.keycheck.outputs.present == 'true'
+        env:
+          AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -o pipefail
+          .venv/bin/harbor run -c job_ci.yaml 2>&1 | tee run.log
+          echo "exit=${PIPESTATUS[0]}"
+
+      - name: Collect results
+        if: always()
+        run: |
+          find jobs -maxdepth 4 -name 'reward.json' -exec sh -c 'echo "== $1"; cat "$1"' _ {} \; 2>/dev/null || true
+          find jobs -maxdepth 3 -type d 2>/dev/null | head -40
+          du -sh jobs 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: harbor-run-${{ github.run_id }}
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            run.log
+            job_ci.yaml
+            jobs/**/verifier/**
+            jobs/**/agent/messages.json
+            jobs/**/*.log
